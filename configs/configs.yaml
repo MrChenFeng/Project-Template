@@ -1,0 +1,14 @@
+production:
+  rundir: /var/run/example
+  database: /var/lib/example/db.sqlite
+  loglevel: warning
+
+staging:
+  database: memory
+
+development:
+  loglevel: debug
+ttt-ttt: 1
+dataset: /data/dbsnp/variants.vcf
+name:
+    tddd: 1
