@@ -1,89 +1,234 @@
+from __future__ import print_function, division, absolute_import
 import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torch.utils.model_zoo as model_zoo
 
 
-class Conv_Block(nn.Module):
-    """The base unit used in the network.
-    >>> input = Variable(torch.randn(4, 3, 96, 96))
-    >>> net = Conv_Block(3, 32)
-    >>> output = net(input)
-    >>> output.size()
-    torch.Size([4, 32, 96, 96])
-    >>> net = Conv_Block(3, 16, pooling=True)
-    >>> output = net(input)
-    >>> output.size()
-    torch.Size([4, 16, 48, 48])
-    """
+__all__ = ['Resnet',
+           #'resnet18', 'resnet34', 'resnet50', 'resnet101',
+           'resnet152']
 
-    def __init__(self, in_channels, out_channels, pooling=False):
-        super(Conv_Block, self).__init__()
+pretrained_settings = {
+    'resnet152': {
+        'imagenet': {
+            'url': 'http://data.lip6.fr/cadene/pretrainedmodels/resnet152-2e20f6b4.pth',
+            'input_space': 'RGB',
+            'input_size': [3, 224, 224],
+            'input_range': [0, 1],
+            'mean': [0.485, 0.456, 0.406],
+            'std': [0.229, 0.224, 0.225],
+            'num_classes': 1000
+        }
+    }
+}
 
-        if pooling:
-            layers = [nn.ZeroPad2d([0, 1, 0, 1]), nn.Conv2d(in_channels, out_channels, 3, 2, 0)]
-        else:
-            layers = [nn.Conv2d(in_channels, out_channels, 3, 1, 1)]
 
-        layers.extend([nn.BatchNorm2d(out_channels), nn.ELU()])
+def conv3x3(in_planes, out_planes, stride=1):
+    "3x3 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=True)
 
-        self.layers = nn.Sequential(*layers)
 
-    def forward(self, input):
-        x = self.layers(input)
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=True)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=True)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=True)
+        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out
+
+class Resnet(nn.Module):
+
+    def __init__(self, block, layers, num_classes=1000):
+        self.inplanes = 64
+        # Special attributs
+        self.input_space = None
+        self.input_size = (299, 299, 3)
+        self.mean = None
+        self.std = None
+        super(Resnet, self).__init__()
+        # Modules
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
+                                bias=True)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.last_linear = nn.Linear(512 * block.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=True),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def features(self, input):
+        x = self.conv1(input)
+        self.conv1_input = x.clone()
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
         return x
 
-class ResNet(nn.Module):
-    '''
-    Pose Encoder (Fully convoluted encoder)
-    Comments shows when input size (Bx3x96x96)
-    The input size should be no smaller than (Bx3x16x16)
-    '''
+    def logits(self, features):
+        adaptiveAvgPoolWidth = features.shape[2]
+        x = F.avg_pool2d(features, kernel_size=adaptiveAvgPoolWidth)
+        x = x.view(x.size(0), -1)
+        x = self.last_linear(x)
+        return x
 
-    def __init__(self, dim):
-        super(ResNet, self).__init__()
-        self.dim = dim
-        conv_layers = [
-            Conv_Block(3, 32),  # Bx32x96x96
-            Conv_Block(32, 64),  # Bx64x96x96
-            Conv_Block(64, 64, pooling=True),  # Bx64x48x48
-            Conv_Block(64, 64),  # Bx64x48x48
-            Conv_Block(64, 128),  # Bx128x48x48
-            Conv_Block(128, 128, pooling=True),  # Bx128x24x24
-            Conv_Block(128, 96),  # Bx96x24x24
-            Conv_Block(96, 192),  # Bx192x24x24
-            Conv_Block(192, 192, pooling=True),  # Bx192x12x12
-            Conv_Block(192, 128),  # Bx128x12x12
-            Conv_Block(128, 256),  # Bx256x12x12
-            Conv_Block(256, 256, pooling=True),  # Bx256x6x6
-            Conv_Block(256, 160),  # Bx160x6x6
-            Conv_Block(160, self.dim),  # Bx320x6x6
-            nn.AdaptiveAvgPool2d((1, 1)),  # Bx320x1x1 Global Pooling
-            nn.ELU()
-        ]
+    def forward(self, input):
+        x = self.features(input)
+        x = self.logits(x)
+        return x
 
-        self.conv_layers = nn.Sequential(*conv_layers)
-        self.linear = nn.Linear(self.dim,4)
 
-    def forward(self, x, outlayer = None):
-        """
+def resnet18(num_classes=1000):
+    """Constructs a ResNet-18 model.
 
-        :param input: images input
-        :param outlayer: the level of feature map
-        :return: Correspoding output
-        """
-        if outlayer == None:
-            x = self.conv_layers(x)
-            x = x.view(-1, self.dim)
-            x = self.linear(x)
-            return x
-        else:
-            for i in range(outlayer):
-                x = self.conv_layers[i](x)
-            return x
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = Resnet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
+    return model
 
-if __name__ == '__main__':
-    t = ResNet(4)
-    from torchsummary import summary
-    summary(t.cuda(),(3,96,96))
-    import torch
-    test = torch.randn(10,3,96,96).cuda()
 
-    tmp = t(test)
+def resnet34(num_classes=1000):
+    """Constructs a ResNet-34 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = Resnet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes)
+    return model
+
+
+def resnet50(num_classes=1000):
+    """Constructs a ResNet-50 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = Resnet(Bottleneck, [3, 4, 6, 3], num_classes=num_classes)
+    return model
+
+
+def resnet101(num_classes=1000):
+    """Constructs a ResNet-101 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = Resnet(Bottleneck, [3, 4, 23, 3], num_classes=num_classes)
+    return model
+
+
+def resnet152(num_classes=1000, pretrained='imagenet'):
+    """Constructs a ResNet-152 model.
+
+    Args:
+        pretrained (bool): If True, returns a model pre-trained on ImageNet
+    """
+    model = Resnet(Bottleneck, [3, 8, 36, 3], num_classes=num_classes)
+    if pretrained is not None:
+        settings = pretrained_settings['resnet152'][pretrained]
+        assert num_classes == settings['num_classes'], \
+            "num_classes should be {}, but is {}".format(settings['num_classes'], num_classes)
+        model.load_state_dict(model_zoo.load_url(settings['url']))
+        model.input_space = settings['input_space']
+        model.input_size = settings['input_size']
+        model.input_range = settings['input_range']
+        model.mean = settings['mean']
+        model.std = settings['std']
+    return model
+
